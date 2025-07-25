@@ -1,5 +1,9 @@
 # Google Photos Takeout Exif Fixer
 
+> [!WARNING]  
+> This script is 95% vibecoded using cline + Claude Sonnet 4 (20250514-v1).
+> Use at your own risk.
+
 This Python script synchronizes metadata in photos and videos with metadata from Google Photos takeout. For photos, it updates EXIF data (photo taken time and GPS coordinates). For videos, it updates video metadata using ffmpeg. For all media files, it updates file system timestamps to preserve "taken at" information.
 
 ## Features
