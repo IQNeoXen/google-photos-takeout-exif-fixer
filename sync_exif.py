@@ -4,7 +4,7 @@ Google Photos Takeout Media Synchronizer
 
 This script synchronizes metadata in photos and videos with metadata from Google Photos takeout.
 For photos: Updates EXIF data (photo taken time and GPS coordinates) when they don't match the JSON metadata.
-For videos: Updates video metadata (creation time and GPS coordinates) using ffmpeg when they don't match.
+For videos: Only updates file system timestamps (video metadata updates are skipped due to ffmpeg complexity).
 For all media: Updates file system timestamps to preserve "taken at" information.
 
 Usage:
@@ -18,11 +18,9 @@ import logging
 import argparse
 from datetime import datetime
 from pathlib import Path
-from typing import Dict, List, Tuple, Optional, Set
+from typing import Dict, List, Tuple, Optional
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from threading import Lock
-import time
-import re
 
 try:
     from PIL import Image
@@ -44,8 +42,11 @@ IMAGE_EXTENSIONS = {'.jpg', '.jpeg', '.png', '.tiff', '.tif', '.bmp'}
 VIDEO_EXTENSIONS = {'.mp4', '.mov', '.avi', '.mkv', '.webm', '.m4v', '.3gp'}
 MEDIA_EXTENSIONS = IMAGE_EXTENSIONS | VIDEO_EXTENSIONS
 
+# EXIF-supported formats (only JPEG and TIFF support EXIF data)
+EXIF_SUPPORTED_EXTENSIONS = {'.jpg', '.jpeg', '.tiff', '.tif'}
+
 class ExifSynchronizer:
-    def __init__(self, dry_run: bool = True, verbose: bool = False, max_workers: Optional[int] = None):
+    def __init__(self, dry_run: bool = True, verbose: bool = False, max_workers: Optional[int] = None, log_file: Optional[str] = None):
         self.dry_run = dry_run
         self.verbose = verbose
         self.max_workers = max_workers or min(32, (os.cpu_count() or 1) * 2)
@@ -71,20 +72,29 @@ class ExifSynchronizer:
         self.failed_files_lock = Lock()
         
         # Setup logging
-        self.setup_logging()
+        self.setup_logging(log_file)
         
-    def setup_logging(self):
+    def setup_logging(self, log_file: Optional[str] = None):
         """Setup logging configuration"""
         log_format = '%(asctime)s - %(levelname)s - %(message)s'
         log_level = logging.DEBUG if self.verbose else logging.INFO
+        
+        # Create handlers list
+        handlers = [logging.StreamHandler(sys.stdout)]
+        
+        # Add file handler if log file is specified
+        if log_file:
+            file_handler = logging.FileHandler(log_file)
+            file_handler.setFormatter(logging.Formatter(log_format))
+            file_handler.setLevel(log_level)
+            handlers.append(file_handler)
         
         # Configure root logger
         logging.basicConfig(
             level=log_level,
             format=log_format,
-            handlers=[
-                logging.StreamHandler(sys.stdout)
-            ]
+            handlers=handlers,
+            force=True  # Override any existing configuration
         )
         
         self.logger = logging.getLogger(__name__)
@@ -109,6 +119,10 @@ class ExifSynchronizer:
     def is_video_file(self, file_path: Path) -> bool:
         """Check if file is a video"""
         return file_path.suffix.lower() in VIDEO_EXTENSIONS
+    
+    def supports_exif(self, file_path: Path) -> bool:
+        """Check if file format supports EXIF data"""
+        return file_path.suffix.lower() in EXIF_SUPPORTED_EXTENSIONS
     
     def find_metadata_file(self, media_file: Path) -> Optional[Path]:
         """Find metadata JSON file by scanning directory and matching prefixes"""
@@ -289,27 +303,28 @@ class ExifSynchronizer:
     def update_exif_datetime(self, image_path: Path, new_datetime: datetime) -> bool:
         """Update EXIF datetime in image file"""
         try:
-            with Image.open(image_path) as img:
-                exif_dict = piexif.load(img.info.get('exif', b''))
+            # Load existing EXIF data
+            exif_dict = piexif.load(str(image_path))
+            
+            # Format datetime for EXIF
+            datetime_str = new_datetime.strftime('%Y:%m:%d %H:%M:%S')
+            
+            # Update datetime tags
+            if 'Exif' not in exif_dict:
+                exif_dict['Exif'] = {}
+            if '0th' not in exif_dict:
+                exif_dict['0th'] = {}
                 
-                # Format datetime for EXIF
-                datetime_str = new_datetime.strftime('%Y:%m:%d %H:%M:%S')
-                
-                # Update datetime tags
-                if 'Exif' not in exif_dict:
-                    exif_dict['Exif'] = {}
-                if '0th' not in exif_dict:
-                    exif_dict['0th'] = {}
-                    
-                exif_dict['Exif'][piexif.ExifIFD.DateTimeOriginal] = datetime_str
-                exif_dict['Exif'][piexif.ExifIFD.DateTime] = datetime_str
-                exif_dict['0th'][piexif.ImageIFD.DateTime] = datetime_str
-                
-                # Save the image with updated EXIF
-                exif_bytes = piexif.dump(exif_dict)
-                img.save(image_path, exif=exif_bytes)
-                
-                return True
+            # Use the correct tag constants
+            exif_dict['Exif'][piexif.ExifIFD.DateTimeOriginal] = datetime_str.encode('utf-8')
+            exif_dict['Exif'][piexif.ExifIFD.DateTimeDigitized] = datetime_str.encode('utf-8')
+            exif_dict['0th'][piexif.ImageIFD.DateTime] = datetime_str.encode('utf-8')
+            
+            # Save the updated EXIF data back to the file
+            exif_bytes = piexif.dump(exif_dict)
+            piexif.insert(exif_bytes, str(image_path))
+            
+            return True
                 
         except Exception as e:
             self.logger.error(f"Failed to update EXIF datetime for {image_path}: {e}")
@@ -318,32 +333,32 @@ class ExifSynchronizer:
     def update_exif_gps(self, image_path: Path, lat: float, lon: float) -> bool:
         """Update GPS coordinates in EXIF data"""
         try:
-            with Image.open(image_path) as img:
-                exif_dict = piexif.load(img.info.get('exif', b''))
+            # Load existing EXIF data
+            exif_dict = piexif.load(str(image_path))
+            
+            def decimal_to_dms(decimal_degrees):
+                """Convert decimal degrees to degrees, minutes, seconds"""
+                degrees = int(abs(decimal_degrees))
+                minutes_float = (abs(decimal_degrees) - degrees) * 60
+                minutes = int(minutes_float)
+                seconds = (minutes_float - minutes) * 60
                 
-                def decimal_to_dms(decimal_degrees):
-                    """Convert decimal degrees to degrees, minutes, seconds"""
-                    degrees = int(abs(decimal_degrees))
-                    minutes_float = (abs(decimal_degrees) - degrees) * 60
-                    minutes = int(minutes_float)
-                    seconds = (minutes_float - minutes) * 60
-                    
-                    return ((degrees, 1), (minutes, 1), (int(seconds * 1000), 1000))
-                
-                if 'GPS' not in exif_dict:
-                    exif_dict['GPS'] = {}
-                
-                # Set GPS coordinates
-                exif_dict['GPS'][piexif.GPSIFD.GPSLatitude] = decimal_to_dms(lat)
-                exif_dict['GPS'][piexif.GPSIFD.GPSLatitudeRef] = b'N' if lat >= 0 else b'S'
-                exif_dict['GPS'][piexif.GPSIFD.GPSLongitude] = decimal_to_dms(lon)
-                exif_dict['GPS'][piexif.GPSIFD.GPSLongitudeRef] = b'E' if lon >= 0 else b'W'
-                
-                # Save the image with updated EXIF
-                exif_bytes = piexif.dump(exif_dict)
-                img.save(image_path, exif=exif_bytes)
-                
-                return True
+                return ((degrees, 1), (minutes, 1), (int(seconds * 1000), 1000))
+            
+            if 'GPS' not in exif_dict:
+                exif_dict['GPS'] = {}
+            
+            # Set GPS coordinates
+            exif_dict['GPS'][piexif.GPSIFD.GPSLatitude] = decimal_to_dms(lat)
+            exif_dict['GPS'][piexif.GPSIFD.GPSLatitudeRef] = b'N' if lat >= 0 else b'S'
+            exif_dict['GPS'][piexif.GPSIFD.GPSLongitude] = decimal_to_dms(lon)
+            exif_dict['GPS'][piexif.GPSIFD.GPSLongitudeRef] = b'E' if lon >= 0 else b'W'
+            
+            # Save the updated EXIF data back to the file
+            exif_bytes = piexif.dump(exif_dict)
+            piexif.insert(exif_bytes, str(image_path))
+            
+            return True
                 
         except Exception as e:
             self.logger.error(f"Failed to update GPS coordinates for {image_path}: {e}")
@@ -352,7 +367,13 @@ class ExifSynchronizer:
     def get_video_metadata_datetime(self, video_path: Path) -> Optional[datetime]:
         """Extract creation time from video metadata using ffmpeg"""
         try:
+            if self.verbose:
+                self.logger.debug(f"Probing video metadata for {video_path}")
+            
             probe = ffmpeg.probe(str(video_path))
+            
+            if self.verbose:
+                self.logger.debug(f"ffmpeg probe successful for {video_path}")
             
             # Try to get creation time from various metadata fields
             creation_time = None
@@ -360,25 +381,37 @@ class ExifSynchronizer:
             # Check format metadata first
             if 'format' in probe and 'tags' in probe['format']:
                 tags = probe['format']['tags']
+                if self.verbose:
+                    self.logger.debug(f"Format tags found: {list(tags.keys())}")
                 # Common creation time fields in video metadata
                 for field in ['creation_time', 'date', 'DATE', 'Creation Time']:
                     if field in tags:
                         creation_time = tags[field]
+                        if self.verbose:
+                            self.logger.debug(f"Found creation time in format.{field}: {creation_time}")
                         break
             
             # If not found in format, check streams
             if not creation_time and 'streams' in probe:
-                for stream in probe['streams']:
+                if self.verbose:
+                    self.logger.debug(f"Checking {len(probe['streams'])} streams for creation time")
+                for i, stream in enumerate(probe['streams']):
                     if 'tags' in stream:
                         tags = stream['tags']
+                        if self.verbose:
+                            self.logger.debug(f"Stream {i} tags found: {list(tags.keys())}")
                         for field in ['creation_time', 'date', 'DATE', 'Creation Time']:
                             if field in tags:
                                 creation_time = tags[field]
+                                if self.verbose:
+                                    self.logger.debug(f"Found creation time in stream {i}.{field}: {creation_time}")
                                 break
                     if creation_time:
                         break
             
             if creation_time:
+                if self.verbose:
+                    self.logger.debug(f"Parsing creation time: {creation_time}")
                 # Parse various datetime formats
                 try:
                     # ISO format with timezone (common in video metadata)
@@ -386,60 +419,31 @@ class ExifSynchronizer:
                         # Remove timezone info for parsing
                         dt_str = creation_time.replace('Z', '').split('+')[0].split('-')[0:3]
                         dt_str = '-'.join(dt_str[:3]) + 'T' + dt_str[3] if len(dt_str) > 3 else creation_time.replace('Z', '').split('+')[0]
-                        return datetime.fromisoformat(dt_str.replace('Z', ''))
+                        parsed_dt = datetime.fromisoformat(dt_str.replace('Z', ''))
+                        if self.verbose:
+                            self.logger.debug(f"Parsed ISO datetime: {parsed_dt}")
+                        return parsed_dt
                     # Standard datetime format
                     elif ':' in creation_time:
-                        return datetime.strptime(creation_time, '%Y-%m-%d %H:%M:%S')
-                except ValueError:
-                    pass
+                        parsed_dt = datetime.strptime(creation_time, '%Y-%m-%d %H:%M:%S')
+                        if self.verbose:
+                            self.logger.debug(f"Parsed standard datetime: {parsed_dt}")
+                        return parsed_dt
+                except ValueError as parse_error:
+                    if self.verbose:
+                        self.logger.debug(f"Failed to parse datetime '{creation_time}': {parse_error}")
+            else:
+                if self.verbose:
+                    self.logger.debug(f"No creation time found in video metadata for {video_path}")
                     
         except Exception as e:
-            self.logger.debug(f"Could not read video metadata datetime from {video_path}: {e}")
+            if self.verbose:
+                self.logger.debug(f"ffmpeg probe failed for {video_path}: {e}")
+            else:
+                self.logger.debug(f"Could not read video metadata datetime from {video_path}: {e}")
             
         return None
     
-    def update_video_metadata(self, video_path: Path, new_datetime: datetime, 
-                             lat: Optional[float] = None, lon: Optional[float] = None) -> bool:
-        """Update video metadata using ffmpeg"""
-        try:
-            # Create a temporary output file
-            temp_output = video_path.with_suffix(f'.temp{video_path.suffix}')
-            
-            # Prepare metadata dictionary
-            metadata = {
-                'creation_time': new_datetime.strftime('%Y-%m-%dT%H:%M:%S.000000Z')
-            }
-            
-            # Add GPS coordinates if provided
-            if lat is not None and lon is not None:
-                metadata['location'] = f"{lat:+.6f}{lon:+.6f}/"
-                metadata['location-eng'] = f"{lat:+.6f}{lon:+.6f}/"
-            
-            # Use ffmpeg to copy the video with updated metadata
-            input_stream = ffmpeg.input(str(video_path))
-            output_stream = ffmpeg.output(
-                input_stream,
-                str(temp_output),
-                vcodec='copy',  # Copy video stream without re-encoding
-                acodec='copy',  # Copy audio stream without re-encoding
-                **{f'metadata:{k}': v for k, v in metadata.items()}
-            )
-            
-            # Run ffmpeg command
-            ffmpeg.run(output_stream, overwrite_output=True, quiet=True)
-            
-            # Replace original file with updated file
-            temp_output.replace(video_path)
-            
-            return True
-            
-        except Exception as e:
-            self.logger.error(f"Failed to update video metadata for {video_path}: {e}")
-            # Clean up temp file if it exists
-            temp_output = video_path.with_suffix(f'.temp{video_path.suffix}')
-            if temp_output.exists():
-                temp_output.unlink()
-            return False
     
     def process_file(self, media_file: Path) -> Dict[str, any]:
         """Process a single media file (thread-safe)"""
@@ -468,13 +472,15 @@ class ExifSynchronizer:
             
             # Get current metadata based on file type
             try:
-                if self.is_image_file(media_file):
+                if self.is_image_file(media_file) and self.supports_exif(media_file):
+                    # Only try to read EXIF from supported formats
                     current_datetime = self.get_exif_datetime(media_file)
                     current_lat, current_lon = self.get_exif_gps(media_file)
                 elif self.is_video_file(media_file):
                     current_datetime = self.get_video_metadata_datetime(media_file)
-                    current_lat, current_lon = None, None  # Video GPS extraction not implemented yet
+                    current_lat, current_lon = None, None  # Skip video GPS/metadata updates
                 else:
+                    # For non-EXIF image formats (PNG, BMP) and other files
                     current_datetime = None
                     current_lat, current_lon = None, None
             except Exception as e:
@@ -538,16 +544,16 @@ class ExifSynchronizer:
             # Apply changes if not in dry-run mode
             if changes_needed and not self.dry_run:
                 try:
-                    # Apply datetime and GPS updates based on file type
-                    if self.is_image_file(media_file):
-                        # Apply datetime update for images
+                    # Apply datetime and GPS updates based on file type and EXIF support
+                    if self.is_image_file(media_file) and self.supports_exif(media_file):
+                        # Apply datetime update for EXIF-supported images
                         if datetime_needs_update:
                             if not self.update_exif_datetime(media_file, metadata_datetime):
                                 result['error'] = 'Failed to update EXIF datetime'
                                 result['error_type'] = 'exif_write_error'
                                 return result
                         
-                        # Apply GPS update for images
+                        # Apply GPS update for EXIF-supported images
                         if gps_needs_update:
                             if not self.update_exif_gps(media_file, metadata_lat, metadata_lon):
                                 result['error'] = 'Failed to update GPS coordinates'
@@ -555,12 +561,8 @@ class ExifSynchronizer:
                                 return result
                     
                     elif self.is_video_file(media_file):
-                        # Apply datetime and GPS updates for videos
-                        if datetime_needs_update or gps_needs_update:
-                            if not self.update_video_metadata(media_file, metadata_datetime, metadata_lat, metadata_lon):
-                                result['error'] = 'Failed to update video metadata'
-                                result['error_type'] = 'exif_write_error'
-                                return result
+                        # For videos, only update file timestamps (skip metadata updates)
+                        pass
                     
                     # Apply file timestamp update (universal for all file types)
                     if timestamps_need_update:
@@ -756,14 +758,8 @@ Supported formats:
     # Determine run mode - dry-run only when explicitly requested
     dry_run = args.dry_run
     
-    # Setup additional logging to file if requested
-    if args.log_file:
-        file_handler = logging.FileHandler(args.log_file)
-        file_handler.setFormatter(logging.Formatter('%(asctime)s - %(levelname)s - %(message)s'))
-        logging.getLogger().addHandler(file_handler)
-    
     # Create synchronizer and process files
-    synchronizer = ExifSynchronizer(dry_run=dry_run, verbose=args.verbose, max_workers=args.threads)
+    synchronizer = ExifSynchronizer(dry_run=dry_run, verbose=args.verbose, max_workers=args.threads, log_file=args.log_file)
     
     try:
         synchronizer.process_directory(root_path)
